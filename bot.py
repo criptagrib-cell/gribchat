@@ -1,8 +1,10 @@
 import os
 import base64
 import io
+import json
 import logging
 from groq import Groq
+from duckduckgo_search import DDGS
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -16,7 +18,8 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
-    "You are a helpful assistant. Respond in the same language the user writes in."
+    "You are a helpful assistant. Respond in the same language the user writes in. "
+    "Use the web_search tool when you need current information or facts you're unsure about."
 )
 TEXT_MODEL = "llama-3.3-70b-versatile"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -24,6 +27,37 @@ MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 
 client = Groq(api_key=GROQ_API_KEY)
 conversations: dict[int, list] = {}
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the internet for current information, news, prices, facts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"}
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+
+def web_search(query: str) -> str:
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=5))
+        if not results:
+            return "Результатов не найдено."
+        return "\n\n".join(
+            f"{r['title']}\n{r['body']}\nИсточник: {r['href']}" for r in results
+        )
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return f"Ошибка поиска: {e}"
 
 
 def get_history(user_id: int) -> list:
@@ -37,11 +71,58 @@ def add_message(user_id: int, role: str, content):
         conversations[user_id] = history[-MAX_HISTORY:]
 
 
+def call_with_tools(messages: list) -> str:
+    local_messages = list(messages)
+    for _ in range(5):
+        response = client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=local_messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=2048,
+        )
+        msg = response.choices[0].message
+
+        if not msg.tool_calls:
+            return msg.content or ""
+
+        local_messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }
+                }
+                for tc in msg.tool_calls
+            ]
+        })
+
+        for tc in msg.tool_calls:
+            if tc.function.name == "web_search":
+                args = json.loads(tc.function.arguments)
+                result = web_search(args["query"])
+            else:
+                result = "Unknown tool"
+            local_messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result
+            })
+
+    return "Не удалось получить ответ."
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я умею:\n"
         "• Отвечать на вопросы\n"
-        "• Анализировать фотографии (просто отправь фото)\n\n"
+        "• Искать в интернете\n"
+        "• Анализировать фотографии\n\n"
         "/reset — очистить историю диалога"
     )
 
@@ -59,12 +140,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_message(user_id, "user", user_text)
 
     try:
-        response = client.chat.completions.create(
-            model=TEXT_MODEL,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + get_history(user_id),
-            max_tokens=2048,
-        )
-        reply = response.choices[0].message.content or ""
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + get_history(user_id)
+        reply = call_with_tools(messages)
         add_message(user_id, "assistant", reply)
     except Exception as e:
         logger.error(f"Text error: {e}")
@@ -84,7 +161,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await file.download_to_memory(buf)
     image_b64 = base64.b64encode(buf.getvalue()).decode()
 
-    caption = update.message.caption or "Опиши что на этом изображении."
+    caption = update.message.caption or "Опиши подробно что на этом изображении."
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
