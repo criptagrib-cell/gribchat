@@ -180,7 +180,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_message(user_id, "assistant", reply)
     except Exception as e:
         logger.error(f"Vision error: {e}")
-        reply = "Ошибка при обработке изображения."
+        reply = f"Ошибка: {e}"
 
     await update.message.reply_text(reply)
 
