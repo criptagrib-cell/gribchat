@@ -20,7 +20,8 @@ SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
     "You are a helpful assistant. Respond in the same language the user writes in."
 )
-MODEL = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 
 client = Groq(api_key=GROQ_API_KEY)
@@ -170,7 +171,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=VISION_MODEL,
             messages=messages,
             max_tokens=2048
         )
