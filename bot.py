@@ -1,6 +1,10 @@
 import os
+import base64
+import io
+import json
 import logging
 from groq import Groq
+from duckduckgo_search import DDGS
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -12,37 +16,113 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", "You are a helpful assistant. Respond in the same language the user writes in.")
-MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "40"))
+SYSTEM_PROMPT = os.environ.get(
+    "SYSTEM_PROMPT",
+    "You are a helpful assistant. Respond in the same language the user writes in."
+)
+MODEL = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 
 client = Groq(api_key=GROQ_API_KEY)
-
-# In-memory conversation history: {user_id: [{"role": ..., "content": ...}]}
 conversations: dict[int, list] = {}
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the internet for current information, news, facts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"}
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+
+def web_search(query: str) -> str:
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=5))
+        if not results:
+            return "Результатов не найдено."
+        return "\n\n".join(
+            f"{r['title']}\n{r['body']}\nИсточник: {r['href']}" for r in results
+        )
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return f"Ошибка поиска: {e}"
 
 
 def get_history(user_id: int) -> list:
     return conversations.setdefault(user_id, [])
 
 
-def add_message(user_id: int, role: str, content: str):
+def add_message(user_id: int, role: str, content):
     history = get_history(user_id)
     history.append({"role": role, "content": content})
     if len(history) > MAX_HISTORY:
         conversations[user_id] = history[-MAX_HISTORY:]
 
 
+def call_with_tools(messages: list) -> str:
+    local_messages = list(messages)
+    for _ in range(5):  # максимум 5 раундов tool calling
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=local_messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=2048,
+        )
+        msg = response.choices[0].message
+
+        if not msg.tool_calls:
+            return msg.content or ""
+
+        tool_calls_serialized = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+            }
+            for tc in msg.tool_calls
+        ]
+        local_messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": tool_calls_serialized
+        })
+
+        for tc in msg.tool_calls:
+            if tc.function.name == "web_search":
+                args = json.loads(tc.function.arguments)
+                result = web_search(args["query"])
+                local_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result
+                })
+
+    return "Не удалось получить ответ."
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Я бот на базе Groq (Llama 3.3). Пиши мне что угодно.\n\n"
+        "Привет! Я умею:\n"
+        "• Отвечать на вопросы\n"
+        "• Искать в интернете\n"
+        "• Анализировать фотографии\n\n"
         "/reset — очистить историю диалога"
     )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    conversations.pop(user_id, None)
+    conversations.pop(update.effective_user.id, None)
     await update.message.reply_text("История очищена. Начинаем заново!")
 
 
@@ -51,20 +131,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
     add_message(user_id, "user", user_text)
+
+    try:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + get_history(user_id)
+        reply = call_with_tools(messages)
+        add_message(user_id, "assistant", reply)
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        reply = "Произошла ошибка. Попробуй ещё раз."
+
+    await update.message.reply_text(reply)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    buf = io.BytesIO()
+    await file.download_to_memory(buf)
+    image_b64 = base64.b64encode(buf.getvalue()).decode()
+
+    caption = update.message.caption or "Опиши что на этом изображении."
+
+    image_content = [
+        {"type": "text", "text": caption},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+    ]
+
+    messages = (
+        [{"role": "system", "content": SYSTEM_PROMPT}]
+        + get_history(user_id)
+        + [{"role": "user", "content": image_content}]
+    )
 
     try:
         response = client.chat.completions.create(
             model=MODEL,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + get_history(user_id),
-            max_tokens=2048,
+            messages=messages,
+            max_tokens=2048
         )
-        reply = response.choices[0].message.content
+        reply = response.choices[0].message.content or ""
+        add_message(user_id, "user", f"[Фото] {caption}")
         add_message(user_id, "assistant", reply)
     except Exception as e:
-        logger.error(f"Groq API error: {e}")
-        reply = "Произошла ошибка при обращении к Groq. Попробуй ещё раз."
+        logger.error(f"Vision error: {e}")
+        reply = "Ошибка при обработке изображения."
 
     await update.message.reply_text(reply)
 
@@ -74,6 +189,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
